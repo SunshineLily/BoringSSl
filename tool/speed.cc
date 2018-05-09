@@ -29,7 +29,6 @@
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/ec_key.h>
-#include <openssl/evp.h>
 #include <openssl/nid.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
@@ -153,9 +152,9 @@ static bool SpeedRSA(const std::string &key_name, RSA *key,
   TimeResults results;
   if (!TimeFunction(&results,
                     [key, &sig, &fake_sha256_hash, &sig_len]() -> bool {
-        // Usually during RSA signing we're using a long-lived |RSA| that has
-        // already had all of its |BN_MONT_CTX|s constructed, so it makes
-        // sense to use |key| directly here.
+        /* Usually during RSA signing we're using a long-lived |RSA| that has
+         * already had all of its |BN_MONT_CTX|s constructed, so it makes
+         * sense to use |key| directly here. */
         return RSA_sign(NID_sha256, fake_sha256_hash, sizeof(fake_sha256_hash),
                         sig.get(), &sig_len, key);
       })) {
@@ -167,11 +166,11 @@ static bool SpeedRSA(const std::string &key_name, RSA *key,
 
   if (!TimeFunction(&results,
                     [key, &fake_sha256_hash, &sig, sig_len]() -> bool {
-        // Usually during RSA verification we have to parse an RSA key from a
-        // certificate or similar, in which case we'd need to construct a new
-        // RSA key, with a new |BN_MONT_CTX| for the public modulus. If we were
-        // to use |key| directly instead, then these costs wouldn't be
-        // accounted for.
+        /* Usually during RSA verification we have to parse an RSA key from a
+         * certificate or similar, in which case we'd need to construct a new
+         * RSA key, with a new |BN_MONT_CTX| for the public modulus. If we were
+         * to use |key| directly instead, then these costs wouldn't be
+         * accounted for. */
         bssl::UniquePtr<RSA> verify_key(RSA_new());
         if (!verify_key) {
           return false;
@@ -201,8 +200,7 @@ static uint8_t *align(uint8_t *in, unsigned alignment) {
 }
 
 static bool SpeedAEADChunk(const EVP_AEAD *aead, const std::string &name,
-                           size_t chunk_len, size_t ad_len,
-                           evp_aead_direction_t direction) {
+                           size_t chunk_len, size_t ad_len) {
   static const unsigned kAlignment = 16;
 
   bssl::ScopedEVP_AEAD_CTX ctx;
@@ -215,25 +213,14 @@ static bool SpeedAEADChunk(const EVP_AEAD *aead, const std::string &name,
   std::unique_ptr<uint8_t[]> nonce(new uint8_t[nonce_len]);
   OPENSSL_memset(nonce.get(), 0, nonce_len);
   std::unique_ptr<uint8_t[]> in_storage(new uint8_t[chunk_len + kAlignment]);
-  // N.B. for EVP_AEAD_CTX_seal_scatter the input and output buffers may be the
-  // same size. However, in the direction == evp_aead_open case we still use
-  // non-scattering seal, hence we add overhead_len to the size of this buffer.
-  std::unique_ptr<uint8_t[]> out_storage(
-      new uint8_t[chunk_len + overhead_len + kAlignment]);
-  std::unique_ptr<uint8_t[]> in2_storage(new uint8_t[chunk_len + kAlignment]);
+  std::unique_ptr<uint8_t[]> out_storage(new uint8_t[chunk_len + overhead_len + kAlignment]);
   std::unique_ptr<uint8_t[]> ad(new uint8_t[ad_len]);
   OPENSSL_memset(ad.get(), 0, ad_len);
-  std::unique_ptr<uint8_t[]> tag_storage(
-      new uint8_t[overhead_len + kAlignment]);
-
 
   uint8_t *const in = align(in_storage.get(), kAlignment);
   OPENSSL_memset(in, 0, chunk_len);
   uint8_t *const out = align(out_storage.get(), kAlignment);
   OPENSSL_memset(out, 0, chunk_len + overhead_len);
-  uint8_t *const tag = align(tag_storage.get(), kAlignment);
-  OPENSSL_memset(tag, 0, overhead_len);
-  uint8_t *const in2 = align(in2_storage.get(), kAlignment);
 
   if (!EVP_AEAD_CTX_init_with_direction(ctx.get(), aead, key.get(), key_len,
                                         EVP_AEAD_DEFAULT_TAG_LENGTH,
@@ -244,43 +231,19 @@ static bool SpeedAEADChunk(const EVP_AEAD *aead, const std::string &name,
   }
 
   TimeResults results;
-  if (direction == evp_aead_seal) {
-    if (!TimeFunction(&results,
-                      [chunk_len, nonce_len, ad_len, overhead_len, in, out, tag,
-                       &ctx, &nonce, &ad]() -> bool {
-                        size_t tag_len;
-                        return EVP_AEAD_CTX_seal_scatter(
-                            ctx.get(), out, tag, &tag_len, overhead_len,
-                            nonce.get(), nonce_len, in, chunk_len, nullptr, 0,
-                            ad.get(), ad_len);
-                      })) {
-      fprintf(stderr, "EVP_AEAD_CTX_seal failed.\n");
-      ERR_print_errors_fp(stderr);
-      return false;
-    }
-  } else {
-    size_t out_len;
-    EVP_AEAD_CTX_seal(ctx.get(), out, &out_len, chunk_len + overhead_len,
-                      nonce.get(), nonce_len, in, chunk_len, ad.get(), ad_len);
-
-    if (!TimeFunction(&results,
-                      [chunk_len, nonce_len, ad_len, in2, out, out_len, &ctx,
-                       &nonce, &ad]() -> bool {
-                        size_t in2_len;
-                        // N.B. EVP_AEAD_CTX_open_gather is not implemented for
-                        // all AEADs.
-                        return EVP_AEAD_CTX_open(
-                            ctx.get(), in2, &in2_len, chunk_len, nonce.get(),
-                            nonce_len, out, out_len, ad.get(), ad_len);
-                      })) {
-      fprintf(stderr, "EVP_AEAD_CTX_open failed.\n");
-      ERR_print_errors_fp(stderr);
-      return false;
-    }
+  if (!TimeFunction(&results, [chunk_len, overhead_len, nonce_len, ad_len, in,
+                               out, &ctx, &nonce, &ad]() -> bool {
+        size_t out_len;
+        return EVP_AEAD_CTX_seal(ctx.get(), out, &out_len,
+                                 chunk_len + overhead_len, nonce.get(),
+                                 nonce_len, in, chunk_len, ad.get(), ad_len);
+      })) {
+    fprintf(stderr, "EVP_AEAD_CTX_seal failed.\n");
+    ERR_print_errors_fp(stderr);
+    return false;
   }
 
-  results.PrintWithBytes(
-      name + (direction == evp_aead_seal ? " seal" : " open"), chunk_len);
+  results.PrintWithBytes(name + " seal", chunk_len);
   return true;
 }
 
@@ -290,26 +253,9 @@ static bool SpeedAEAD(const EVP_AEAD *aead, const std::string &name,
     return true;
   }
 
-  return SpeedAEADChunk(aead, name + " (16 bytes)", 16, ad_len,
-                        evp_aead_seal) &&
-         SpeedAEADChunk(aead, name + " (1350 bytes)", 1350, ad_len,
-                        evp_aead_seal) &&
-         SpeedAEADChunk(aead, name + " (8192 bytes)", 8192, ad_len,
-                        evp_aead_seal);
-}
-
-static bool SpeedAEADOpen(const EVP_AEAD *aead, const std::string &name,
-                          size_t ad_len, const std::string &selected) {
-  if (!selected.empty() && name.find(selected) == std::string::npos) {
-    return true;
-  }
-
-  return SpeedAEADChunk(aead, name + " (16 bytes)", 16, ad_len,
-                        evp_aead_open) &&
-         SpeedAEADChunk(aead, name + " (1350 bytes)", 1350, ad_len,
-                        evp_aead_open) &&
-         SpeedAEADChunk(aead, name + " (8192 bytes)", 8192, ad_len,
-                        evp_aead_open);
+  return SpeedAEADChunk(aead, name + " (16 bytes)", 16, ad_len) &&
+         SpeedAEADChunk(aead, name + " (1350 bytes)", 1350, ad_len) &&
+         SpeedAEADChunk(aead, name + " (8192 bytes)", 8192, ad_len);
 }
 
 static bool SpeedHashChunk(const EVP_MD *md, const std::string &name,
@@ -591,41 +537,6 @@ static bool SpeedSPAKE2(const std::string &selected) {
   return true;
 }
 
-static bool SpeedScrypt(const std::string &selected) {
-  if (!selected.empty() && selected.find("scrypt") == std::string::npos) {
-    return true;
-  }
-
-  TimeResults results;
-
-  static const char kPassword[] = "password";
-  static const uint8_t kSalt[] = "NaCl";
-
-  if (!TimeFunction(&results, [&]() -> bool {
-        uint8_t out[64];
-        return !!EVP_PBE_scrypt(kPassword, sizeof(kPassword) - 1, kSalt,
-                                sizeof(kSalt) - 1, 1024, 8, 16, 0 /* max_mem */,
-                                out, sizeof(out));
-      })) {
-    fprintf(stderr, "scrypt failed.\n");
-    return false;
-  }
-  results.Print("scrypt (N = 1024, r = 8, p = 16)");
-
-  if (!TimeFunction(&results, [&]() -> bool {
-        uint8_t out[64];
-        return !!EVP_PBE_scrypt(kPassword, sizeof(kPassword) - 1, kSalt,
-                                sizeof(kSalt) - 1, 16384, 8, 1, 0 /* max_mem */,
-                                out, sizeof(out));
-      })) {
-    fprintf(stderr, "scrypt failed.\n");
-    return false;
-  }
-  results.Print("scrypt (N = 16384, r = 8, p = 1)");
-
-  return true;
-}
-
 static const struct argument kArguments[] = {
     {
      "-filter", kOptionalArgument,
@@ -668,6 +579,18 @@ bool Speed(const std::vector<std::string> &args) {
     return false;
   }
 
+  key.reset(RSA_private_key_from_bytes(kDERRSAPrivate3Prime2048,
+                                       kDERRSAPrivate3Prime2048Len));
+  if (key == nullptr) {
+    fprintf(stderr, "Failed to parse RSA key.\n");
+    ERR_print_errors_fp(stderr);
+    return false;
+  }
+
+  if (!SpeedRSA("RSA 2048 (3 prime, e=3)", key.get(), selected)) {
+    return false;
+  }
+
   key.reset(
       RSA_private_key_from_bytes(kDERRSAPrivate4096, kDERRSAPrivate4096Len));
   if (key == nullptr) {
@@ -701,14 +624,12 @@ bool Speed(const std::vector<std::string> &args) {
                  kLegacyADLen, selected) ||
       !SpeedAEAD(EVP_aead_aes_256_cbc_sha1_tls(), "AES-256-CBC-SHA1",
                  kLegacyADLen, selected) ||
+#if !defined(OPENSSL_SMALL)
       !SpeedAEAD(EVP_aead_aes_128_gcm_siv(), "AES-128-GCM-SIV", kTLSADLen,
                  selected) ||
       !SpeedAEAD(EVP_aead_aes_256_gcm_siv(), "AES-256-GCM-SIV", kTLSADLen,
                  selected) ||
-      !SpeedAEADOpen(EVP_aead_aes_128_gcm_siv(), "AES-128-GCM-SIV", kTLSADLen,
-                     selected) ||
-      !SpeedAEADOpen(EVP_aead_aes_256_gcm_siv(), "AES-256-GCM-SIV", kTLSADLen,
-                     selected) ||
+#endif
       !SpeedHash(EVP_sha1(), "SHA-1", selected) ||
       !SpeedHash(EVP_sha256(), "SHA-256", selected) ||
       !SpeedHash(EVP_sha512(), "SHA-512", selected) ||
@@ -716,8 +637,7 @@ bool Speed(const std::vector<std::string> &args) {
       !SpeedECDH(selected) ||
       !SpeedECDSA(selected) ||
       !Speed25519(selected) ||
-      !SpeedSPAKE2(selected) ||
-      !SpeedScrypt(selected)) {
+      !SpeedSPAKE2(selected)) {
     return false;
   }
 

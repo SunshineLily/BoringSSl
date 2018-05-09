@@ -37,47 +37,30 @@ def CheckedJoin(output, path):
   return os.path.join(output, path)
 
 
-class FileEntry(object):
-  def __init__(self, path, mode, fileobj):
-    self.path = path
-    self.mode = mode
-    self.fileobj = fileobj
-
-
-class SymlinkEntry(object):
-  def __init__(self, path, mode, target):
-    self.path = path
-    self.mode = mode
-    self.target = target
-
-
 def IterateZip(path):
   """
-  IterateZip opens the zip file at path and returns a generator of entry objects
-  for each file in it.
+  IterateZip opens the zip file at path and returns a generator of
+  (filename, mode, fileobj) tuples for each file in it.
   """
   with zipfile.ZipFile(path, 'r') as zip_file:
     for info in zip_file.infolist():
       if info.filename.endswith('/'):
         continue
-      yield FileEntry(info.filename, None, zip_file.open(info))
+      yield (info.filename, None, zip_file.open(info))
 
 
-def IterateTar(path, compression):
+def IterateTar(path):
   """
-  IterateTar opens the tar.gz or tar.bz2 file at path and returns a generator of
-  entry objects for each file in it.
+  IterateTar opens the tar.gz file at path and returns a generator of
+  (filename, mode, fileobj) tuples for each file in it.
   """
-  with tarfile.open(path, 'r:' + compression) as tar_file:
+  with tarfile.open(path, 'r:gz') as tar_file:
     for info in tar_file:
       if info.isdir():
-        pass
-      elif info.issym():
-        yield SymlinkEntry(info.name, None, info.linkname)
-      elif info.isfile():
-        yield FileEntry(info.name, info.mode, tar_file.extractfile(info))
-      else:
+        continue
+      if not info.isfile():
         raise ValueError('Unknown entry type "%s"' % (info.name, ))
+      yield (info.name, info.mode, tar_file.extractfile(info))
 
 
 def main(args):
@@ -115,9 +98,7 @@ def main(args):
   if archive.endswith('.zip'):
     entries = IterateZip(archive)
   elif archive.endswith('.tar.gz'):
-    entries = IterateTar(archive, 'gz')
-  elif archive.endswith('.tar.bz2'):
-    entries = IterateTar(archive, 'bz2')
+    entries = IterateTar(archive)
   else:
     raise ValueError(archive)
 
@@ -129,13 +110,13 @@ def main(args):
     print "Extracting %s to %s" % (archive, output)
     prefix = None
     num_extracted = 0
-    for entry in entries:
+    for path, mode, inp in entries:
       # Even on Windows, zip files must always use forward slashes.
-      if '\\' in entry.path or entry.path.startswith('/'):
-        raise ValueError(entry.path)
+      if '\\' in path or path.startswith('/'):
+        raise ValueError(path)
 
       if not options.no_prefix:
-        new_prefix, rest = entry.path.split('/', 1)
+        new_prefix, rest = path.split('/', 1)
 
         # Ensure the archive is consistent.
         if prefix is None:
@@ -143,25 +124,20 @@ def main(args):
         if prefix != new_prefix:
           raise ValueError((prefix, new_prefix))
       else:
-        rest = entry.path
+        rest = path
 
       # Extract the file into the output directory.
       fixed_path = CheckedJoin(output, rest)
       if not os.path.isdir(os.path.dirname(fixed_path)):
         os.makedirs(os.path.dirname(fixed_path))
-      if isinstance(entry, FileEntry):
-        with open(fixed_path, 'wb') as out:
-          shutil.copyfileobj(entry.fileobj, out)
-      elif isinstance(entry, SymlinkEntry):
-        os.symlink(entry.target, fixed_path)
-      else:
-        raise TypeError('unknown entry type')
+      with open(fixed_path, 'wb') as out:
+        shutil.copyfileobj(inp, out)
 
       # Fix up permissions if needbe.
       # TODO(davidben): To be extra tidy, this should only track the execute bit
       # as in git.
-      if entry.mode is not None:
-        os.chmod(fixed_path, entry.mode)
+      if mode is not None:
+        os.chmod(fixed_path, mode)
 
       # Print every 100 files, so bots do not time out on large archives.
       num_extracted += 1

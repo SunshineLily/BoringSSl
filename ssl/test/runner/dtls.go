@@ -23,6 +23,46 @@ import (
 	"net"
 )
 
+func versionToWire(vers uint16, isDTLS bool) uint16 {
+	if isDTLS {
+		switch vers {
+		case VersionTLS12:
+			return 0xfefd
+		case VersionTLS10:
+			return 0xfeff
+		}
+	} else {
+		switch vers {
+		case VersionSSL30, VersionTLS10, VersionTLS11, VersionTLS12:
+			return vers
+		case VersionTLS13:
+			return tls13DraftVersion
+		}
+	}
+
+	panic("unknown version")
+}
+
+func wireToVersion(vers uint16, isDTLS bool) (uint16, bool) {
+	if isDTLS {
+		switch vers {
+		case 0xfefd:
+			return VersionTLS12, true
+		case 0xfeff:
+			return VersionTLS10, true
+		}
+	} else {
+		switch vers {
+		case VersionSSL30, VersionTLS10, VersionTLS11, VersionTLS12:
+			return vers, true
+		case tls13DraftVersion:
+			return VersionTLS13, true
+		}
+	}
+
+	return 0, false
+}
+
 func (c *Conn) dtlsDoReadRecord(want recordType) (recordType, *block, error) {
 	recordHeaderLen := dtlsRecordHeaderLen
 
@@ -62,9 +102,9 @@ func (c *Conn) dtlsDoReadRecord(want recordType) (recordType, *block, error) {
 	// version is irrelevant.)
 	if typ != recordTypeAlert {
 		if c.haveVers {
-			if vers != c.wireVersion {
+			if wireVers := versionToWire(c.vers, c.isDTLS); vers != wireVers {
 				c.sendAlert(alertProtocolVersion)
-				return 0, nil, c.in.setErrorLocked(fmt.Errorf("dtls: received record with version %x when expecting version %x", vers, c.wireVersion))
+				return 0, nil, c.in.setErrorLocked(fmt.Errorf("dtls: received record with version %x when expecting version %x", vers, wireVers))
 			}
 		} else {
 			// Pre-version-negotiation alerts may be sent with any version.
@@ -130,33 +170,21 @@ func (c *Conn) makeFragment(header, data []byte, fragOffset, fragLen int) []byte
 
 func (c *Conn) dtlsWriteRecord(typ recordType, data []byte) (n int, err error) {
 	if typ != recordTypeHandshake {
-		reorder := typ == recordTypeChangeCipherSpec && c.config.Bugs.ReorderChangeCipherSpec
-
-		// Flush pending handshake messages before writing a new record.
-		if !reorder {
-			err = c.dtlsFlushHandshake()
-			if err != nil {
-				return
-			}
-		}
-
 		// Only handshake messages are fragmented.
 		n, err = c.dtlsWriteRawRecord(typ, data)
 		if err != nil {
 			return
 		}
 
-		if reorder {
-			err = c.dtlsFlushHandshake()
-			if err != nil {
-				return
-			}
-		}
-
 		if typ == recordTypeChangeCipherSpec {
 			err = c.out.changeCipherSpec(c.config)
 			if err != nil {
-				return n, c.sendAlertLocked(alertLevelError, err.(alert))
+				// Cannot call sendAlert directly,
+				// because we already hold c.out.Mutex.
+				c.tmp[0] = alertLevelError
+				c.tmp[1] = byte(err.(alert))
+				c.writeRecord(recordTypeAlert, c.tmp[0:2])
+				return n, c.out.setErrorLocked(&net.OpError{Op: "local error", Err: err})
 			}
 		}
 		return
@@ -189,8 +217,8 @@ func (c *Conn) dtlsWriteRecord(typ recordType, data []byte) (n int, err error) {
 	isFinished := header[0] == typeFinished
 
 	if c.config.Bugs.SendEmptyFragments {
-		c.pendingFragments = append(c.pendingFragments, c.makeFragment(header, data, 0, 0))
-		c.pendingFragments = append(c.pendingFragments, c.makeFragment(header, data, len(data), 0))
+		fragment := c.makeFragment(header, data, 0, 0)
+		c.pendingFragments = append(c.pendingFragments, fragment)
 	}
 
 	firstRun := true
@@ -228,11 +256,7 @@ func (c *Conn) dtlsWriteRecord(typ recordType, data []byte) (n int, err error) {
 		fragOffset += fragLen
 		n += fragLen
 	}
-	shouldSendTwice := c.config.Bugs.MixCompleteMessageWithFragments
-	if isFinished {
-		shouldSendTwice = c.config.Bugs.RetransmitFinished
-	}
-	if shouldSendTwice {
+	if !isFinished && c.config.Bugs.MixCompleteMessageWithFragments {
 		fragment := c.makeFragment(header, data, 0, len(data))
 		c.pendingFragments = append(c.pendingFragments, fragment)
 	}
@@ -344,16 +368,13 @@ func (c *Conn) dtlsSealRecord(typ recordType, data []byte) (b *block, err error)
 	// TODO(nharper): DTLS 1.3 will likely need to set this to
 	// recordTypeApplicationData if c.out.cipher != nil.
 	b.data[0] = byte(typ)
-	vers := c.wireVersion
+	vers := c.vers
 	if vers == 0 {
 		// Some TLS servers fail if the record version is greater than
 		// TLS 1.0 for the initial ClientHello.
-		if c.isDTLS {
-			vers = VersionDTLS10
-		} else {
-			vers = VersionTLS10
-		}
+		vers = VersionTLS10
 	}
+	vers = versionToWire(vers, c.isDTLS)
 	b.data[1] = byte(vers >> 8)
 	b.data[2] = byte(vers)
 	// DTLS records include an explicit sequence number.

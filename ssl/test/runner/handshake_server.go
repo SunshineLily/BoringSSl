@@ -17,8 +17,6 @@ import (
 	"io"
 	"math/big"
 	"time"
-
-	"./ed25519"
 )
 
 // serverHandshakeState contains details of a server handshake in progress.
@@ -161,7 +159,7 @@ func (hs *serverHandshakeState) readClientHello() error {
 		// Per RFC 6347, the version field in HelloVerifyRequest SHOULD
 		// be always DTLS 1.0
 		helloVerifyRequest := &helloVerifyRequestMsg{
-			vers:   VersionDTLS10,
+			vers:   versionToWire(VersionTLS10, c.isDTLS),
 			cookie: make([]byte, 32),
 		}
 		if _, err := io.ReadFull(c.config.rand(), helloVerifyRequest.cookie); err != nil {
@@ -210,69 +208,74 @@ func (hs *serverHandshakeState) readClientHello() error {
 
 	c.clientVersion = hs.clientHello.vers
 
-	// Use the versions extension if supplied, otherwise use the legacy ClientHello version.
-	if len(hs.clientHello.supportedVersions) == 0 {
-		if c.isDTLS {
-			if hs.clientHello.vers <= VersionDTLS12 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionDTLS12)
-			}
-			if hs.clientHello.vers <= VersionDTLS10 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionDTLS10)
-			}
-		} else {
-			if hs.clientHello.vers >= VersionTLS12 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionTLS12)
-			}
-			if hs.clientHello.vers >= VersionTLS11 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionTLS11)
-			}
-			if hs.clientHello.vers >= VersionTLS10 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionTLS10)
-			}
-			if hs.clientHello.vers >= VersionSSL30 {
-				hs.clientHello.supportedVersions = append(hs.clientHello.supportedVersions, VersionSSL30)
-			}
+	// Convert the ClientHello wire version to a protocol version.
+	var clientVersion uint16
+	if c.isDTLS {
+		if hs.clientHello.vers <= 0xfefd {
+			clientVersion = VersionTLS12
+		} else if hs.clientHello.vers <= 0xfeff {
+			clientVersion = VersionTLS10
 		}
-	} else if config.Bugs.ExpectGREASE && !containsGREASE(hs.clientHello.supportedVersions) {
-		return errors.New("tls: no GREASE version value found")
+	} else {
+		if hs.clientHello.vers >= VersionTLS12 {
+			clientVersion = VersionTLS12
+		} else if hs.clientHello.vers >= VersionTLS11 {
+			clientVersion = VersionTLS11
+		} else if hs.clientHello.vers >= VersionTLS10 {
+			clientVersion = VersionTLS10
+		} else if hs.clientHello.vers >= VersionSSL30 {
+			clientVersion = VersionSSL30
+		}
 	}
 
-	if !c.haveVers {
-		if config.Bugs.NegotiateVersion != 0 {
-			c.wireVersion = config.Bugs.NegotiateVersion
-		} else {
-			var found bool
-			for _, vers := range hs.clientHello.supportedVersions {
-				if _, ok := config.isSupportedVersion(vers, c.isDTLS); ok {
-					c.wireVersion = vers
-					found = true
-					break
-				}
+	if config.Bugs.NegotiateVersion != 0 {
+		c.vers = config.Bugs.NegotiateVersion
+	} else if c.haveVers && config.Bugs.NegotiateVersionOnRenego != 0 {
+		c.vers = config.Bugs.NegotiateVersionOnRenego
+	} else if len(hs.clientHello.supportedVersions) > 0 {
+		// Use the versions extension if supplied.
+		var foundVersion, foundGREASE bool
+		for _, extVersion := range hs.clientHello.supportedVersions {
+			if isGREASEValue(extVersion) {
+				foundGREASE = true
 			}
-			if !found {
-				c.sendAlert(alertProtocolVersion)
-				return errors.New("tls: client did not offer any supported protocol versions")
+			extVersion, ok = wireToVersion(extVersion, c.isDTLS)
+			if !ok {
+				continue
+			}
+			if config.isSupportedVersion(extVersion, c.isDTLS) && !foundVersion {
+				c.vers = extVersion
+				foundVersion = true
+				break
 			}
 		}
-	} else if config.Bugs.NegotiateVersionOnRenego != 0 {
-		c.wireVersion = config.Bugs.NegotiateVersionOnRenego
-	}
-
-	c.vers, ok = wireToVersion(c.wireVersion, c.isDTLS)
-	if !ok {
-		panic("Could not map wire version")
+		if !foundVersion {
+			c.sendAlert(alertProtocolVersion)
+			return errors.New("tls: client did not offer any supported protocol versions")
+		}
+		if config.Bugs.ExpectGREASE && !foundGREASE {
+			return errors.New("tls: no GREASE version value found")
+		}
+	} else {
+		// Otherwise, use the legacy ClientHello version.
+		version := clientVersion
+		if maxVersion := config.maxVersion(c.isDTLS); version > maxVersion {
+			version = maxVersion
+		}
+		if version == 0 || !config.isSupportedVersion(version, c.isDTLS) {
+			return fmt.Errorf("tls: client offered an unsupported, maximum protocol version of %x", hs.clientHello.vers)
+		}
+		c.vers = version
 	}
 	c.haveVers = true
 
-	clientProtocol, ok := wireToVersion(c.clientVersion, c.isDTLS)
-
 	// Reject < 1.2 ClientHellos with signature_algorithms.
-	if ok && clientProtocol < VersionTLS12 && len(hs.clientHello.signatureAlgorithms) > 0 {
+	if clientVersion < VersionTLS12 && len(hs.clientHello.signatureAlgorithms) > 0 {
 		return fmt.Errorf("tls: client included signature_algorithms before TLS 1.2")
 	}
 
 	// Check the client cipher list is consistent with the version.
-	if ok && clientProtocol < VersionTLS12 {
+	if clientVersion < VersionTLS12 {
 		for _, id := range hs.clientHello.cipherSuites {
 			if isTLS12Cipher(id) {
 				return fmt.Errorf("tls: client offered TLS 1.2 cipher before TLS 1.2")
@@ -281,7 +284,7 @@ func (hs *serverHandshakeState) readClientHello() error {
 	}
 
 	if config.Bugs.ExpectNoTLS12Session {
-		if len(hs.clientHello.sessionId) > 0 && !isResumptionExperiment(c.wireVersion) {
+		if len(hs.clientHello.sessionId) > 0 {
 			return fmt.Errorf("tls: client offered an unexpected session ID")
 		}
 		if len(hs.clientHello.sessionTicket) > 0 {
@@ -293,11 +296,13 @@ func (hs *serverHandshakeState) readClientHello() error {
 		return fmt.Errorf("tls: client offered unexpected PSK identities")
 	}
 
-	var scsvFound bool
+	var scsvFound, greaseFound bool
 	for _, cipherSuite := range hs.clientHello.cipherSuites {
 		if cipherSuite == fallbackSCSV {
 			scsvFound = true
-			break
+		}
+		if isGREASEValue(cipherSuite) {
+			greaseFound = true
 		}
 	}
 
@@ -307,11 +312,11 @@ func (hs *serverHandshakeState) readClientHello() error {
 		return errors.New("tls: fallback SCSV found when not expected")
 	}
 
-	if config.Bugs.ExpectGREASE && !containsGREASE(hs.clientHello.cipherSuites) {
+	if !greaseFound && config.Bugs.ExpectGREASE {
 		return errors.New("tls: no GREASE cipher suite value found")
 	}
 
-	var greaseFound bool
+	greaseFound = false
 	for _, curve := range hs.clientHello.supportedCurves {
 		if isGREASEValue(uint16(curve)) {
 			greaseFound = true
@@ -337,21 +342,17 @@ func (hs *serverHandshakeState) readClientHello() error {
 		}
 	}
 
-	applyBugsToClientHello(hs.clientHello, config)
-
-	return nil
-}
-
-func applyBugsToClientHello(clientHello *clientHelloMsg, config *Config) {
 	if config.Bugs.IgnorePeerSignatureAlgorithmPreferences {
-		clientHello.signatureAlgorithms = config.signSignatureAlgorithms()
+		hs.clientHello.signatureAlgorithms = config.signSignatureAlgorithms()
 	}
 	if config.Bugs.IgnorePeerCurvePreferences {
-		clientHello.supportedCurves = config.curvePreferences()
+		hs.clientHello.supportedCurves = config.curvePreferences()
 	}
 	if config.Bugs.IgnorePeerCipherPreferences {
-		clientHello.cipherSuites = config.cipherSuites()
+		hs.clientHello.cipherSuites = config.cipherSuites()
 	}
+
+	return nil
 }
 
 func (hs *serverHandshakeState) doTLS13Handshake() error {
@@ -359,13 +360,20 @@ func (hs *serverHandshakeState) doTLS13Handshake() error {
 	config := c.config
 
 	hs.hello = &serverHelloMsg{
-		isDTLS:                c.isDTLS,
-		vers:                  c.wireVersion,
-		sessionId:             hs.clientHello.sessionId,
-		versOverride:          config.Bugs.SendServerHelloVersion,
-		supportedVersOverride: config.Bugs.SendServerSupportedExtensionVersion,
-		customExtension:       config.Bugs.CustomUnencryptedExtension,
-		unencryptedALPN:       config.Bugs.SendUnencryptedALPN,
+		isDTLS:          c.isDTLS,
+		vers:            versionToWire(c.vers, c.isDTLS),
+		versOverride:    config.Bugs.SendServerHelloVersion,
+		customExtension: config.Bugs.CustomUnencryptedExtension,
+		unencryptedALPN: config.Bugs.SendUnencryptedALPN,
+		shortHeader:     hs.clientHello.shortHeaderSupported && config.Bugs.EnableShortHeader,
+	}
+
+	if config.Bugs.AlwaysNegotiateShortHeader {
+		hs.hello.shortHeader = true
+	}
+
+	if hs.hello.shortHeader {
+		c.setShortHeader()
 	}
 
 	hs.hello.random = make([]byte, 32)
@@ -448,7 +456,7 @@ Curves:
 
 	var pskIndex int
 	foundKEMode := bytes.IndexByte(pskKEModes, pskDHEKEMode) >= 0
-	if foundKEMode && !config.SessionTicketsDisabled {
+	if foundKEMode {
 		for i, pskIdentity := range pskIdentities {
 			// TODO(svaldez): Check the obfuscatedTicketAge before accepting 0-RTT.
 			sessionState, ok := c.decryptTicket(pskIdentity.ticket)
@@ -521,7 +529,7 @@ Curves:
 ResendHelloRetryRequest:
 	var sendHelloRetryRequest bool
 	helloRetryRequest := &helloRetryRequestMsg{
-		vers:                c.wireVersion,
+		vers:                versionToWire(c.vers, c.isDTLS),
 		duplicateExtensions: config.Bugs.DuplicateHelloRetryRequestExtensions,
 	}
 
@@ -576,10 +584,6 @@ ResendHelloRetryRequest:
 		c.writeRecord(recordTypeHandshake, helloRetryRequest.marshal())
 		c.flushHandshake()
 
-		if hs.clientHello.hasEarlyData {
-			c.skipEarlyData = true
-		}
-
 		// Read new ClientHello.
 		newMsg, err := c.readHandshake()
 		if err != nil {
@@ -591,12 +595,6 @@ ResendHelloRetryRequest:
 			return unexpectedMessageError(newClientHello, newMsg)
 		}
 		hs.writeClientHash(newClientHello.marshal())
-
-		if newClientHello.hasEarlyData {
-			return errors.New("tls: EarlyData sent in new ClientHello")
-		}
-
-		applyBugsToClientHello(newClientHello, config)
 
 		// Check that the new ClientHello matches the old ClientHello,
 		// except for relevant modifications.
@@ -633,7 +631,6 @@ ResendHelloRetryRequest:
 			newClientHelloCopy.pskIdentities[i].obfuscatedTicketAge = identity.obfuscatedTicketAge
 		}
 		newClientHelloCopy.pskBinders = oldClientHelloCopy.pskBinders
-		newClientHelloCopy.hasEarlyData = oldClientHelloCopy.hasEarlyData
 
 		if !oldClientHelloCopy.equal(&newClientHelloCopy) {
 			return errors.New("tls: new ClientHello does not match")
@@ -656,15 +653,12 @@ ResendHelloRetryRequest:
 	}
 
 	// Decide whether or not to accept early data.
-	if !sendHelloRetryRequest && hs.clientHello.hasEarlyData {
-		if !config.Bugs.AlwaysRejectEarlyData && hs.sessionState != nil {
-			if c.clientProtocol == string(hs.sessionState.earlyALPN) || config.Bugs.AlwaysAcceptEarlyData {
-				encryptedExtensions.extensions.hasEarlyData = true
-			}
-		}
-		if encryptedExtensions.extensions.hasEarlyData {
+	// TODO(nharper): This does not check that ALPN or SNI matches.
+	if hs.clientHello.hasEarlyData {
+		if !sendHelloRetryRequest && hs.sessionState != nil {
+			encryptedExtensions.extensions.hasEarlyData = true
 			earlyTrafficSecret := hs.finishedHash.deriveSecret(earlyTrafficLabel)
-			c.in.useTrafficSecret(c.wireVersion, hs.suite, earlyTrafficSecret, clientWrite)
+			c.in.useTrafficSecret(c.vers, hs.suite, earlyTrafficSecret, clientWrite)
 
 			for _, expectedMsg := range config.Bugs.ExpectEarlyData {
 				if err := c.readRecord(recordTypeApplicationData); err != nil {
@@ -675,14 +669,11 @@ ResendHelloRetryRequest:
 				}
 				c.in.freeBlock(c.input)
 				c.input = nil
+
 			}
 		} else {
 			c.skipEarlyData = true
 		}
-	}
-
-	if config.Bugs.SendEarlyDataExtension {
-		encryptedExtensions.extensions.hasEarlyData = true
 	}
 
 	// Resolve ECDHE and compute the handshake secret.
@@ -755,13 +746,9 @@ ResendHelloRetryRequest:
 	}
 	c.flushHandshake()
 
-	if isResumptionExperiment(c.wireVersion) {
-		c.writeRecord(recordTypeChangeCipherSpec, []byte{1})
-	}
-
 	// Switch to handshake traffic keys.
 	serverHandshakeTrafficSecret := hs.finishedHash.deriveSecret(serverHandshakeTrafficLabel)
-	c.out.useTrafficSecret(c.wireVersion, hs.suite, serverHandshakeTrafficSecret, serverWrite)
+	c.out.useTrafficSecret(c.vers, hs.suite, serverHandshakeTrafficSecret, serverWrite)
 	// Derive handshake traffic read key, but don't switch yet.
 	clientHandshakeTrafficSecret := hs.finishedHash.deriveSecret(clientHandshakeTrafficLabel)
 
@@ -855,10 +842,8 @@ ResendHelloRetryRequest:
 			certVerify.signatureAlgorithm = config.Bugs.SendSignatureAlgorithm
 		}
 
-		if !config.Bugs.SkipCertificateVerify {
-			hs.writeServerHash(certVerify.marshal())
-			c.writeRecord(recordTypeHandshake, certVerify.marshal())
-		}
+		hs.writeServerHash(certVerify.marshal())
+		c.writeRecord(recordTypeHandshake, certVerify.marshal())
 	} else if hs.sessionState != nil {
 		// Pick up certificates from the session instead.
 		if len(hs.sessionState.certificates) > 0 {
@@ -880,19 +865,6 @@ ResendHelloRetryRequest:
 	}
 	c.flushHandshake()
 
-	if encryptedExtensions.extensions.hasEarlyData && !c.skipEarlyData {
-		for _, expectedMsg := range config.Bugs.ExpectLateEarlyData {
-			if err := c.readRecord(recordTypeApplicationData); err != nil {
-				return err
-			}
-			if !bytes.Equal(c.input.data[c.input.off:], expectedMsg) {
-				return errors.New("ExpectLateEarlyData: did not get expected message")
-			}
-			c.in.freeBlock(c.input)
-			c.input = nil
-		}
-	}
-
 	// The various secrets do not incorporate the client's final leg, so
 	// derive them now before updating the handshake context.
 	hs.finishedHash.addEntropy(hs.finishedHash.zeroSecret())
@@ -902,7 +874,7 @@ ResendHelloRetryRequest:
 
 	// Switch to application data keys on write. In particular, any alerts
 	// from the client certificate are sent over these keys.
-	c.out.useTrafficSecret(c.wireVersion, hs.suite, serverTrafficSecret, serverWrite)
+	c.out.useTrafficSecret(c.vers, hs.suite, serverTrafficSecret, serverWrite)
 
 	// Send 0.5-RTT messages.
 	for _, halfRTTMsg := range config.Bugs.SendHalfRTTData {
@@ -921,14 +893,8 @@ ResendHelloRetryRequest:
 		}
 	}
 
-	if isResumptionClientCCSExperiment(c.wireVersion) && !c.skipEarlyData {
-		if err := c.readRecord(recordTypeChangeCipherSpec); err != nil {
-			return err
-		}
-	}
-
 	// Switch input stream to handshake traffic keys.
-	c.in.useTrafficSecret(c.wireVersion, hs.suite, clientHandshakeTrafficSecret, clientWrite)
+	c.in.useTrafficSecret(c.vers, hs.suite, clientHandshakeTrafficSecret, clientWrite)
 
 	// If we requested a client certificate, then the client must send a
 	// certificate message, even if it's empty.
@@ -1032,7 +998,7 @@ ResendHelloRetryRequest:
 	hs.writeClientHash(clientFinished.marshal())
 
 	// Switch to application data keys on read.
-	c.in.useTrafficSecret(c.wireVersion, hs.suite, clientTrafficSecret, clientWrite)
+	c.in.useTrafficSecret(c.vers, hs.suite, clientTrafficSecret, clientWrite)
 
 	c.cipherSuite = hs.suite
 	c.resumptionSecret = hs.finishedHash.deriveSecret(resumptionLabel)
@@ -1056,14 +1022,10 @@ func (hs *serverHandshakeState) processClientHello() (isResume bool, err error) 
 
 	hs.hello = &serverHelloMsg{
 		isDTLS:            c.isDTLS,
-		vers:              c.wireVersion,
+		vers:              versionToWire(c.vers, c.isDTLS),
 		versOverride:      config.Bugs.SendServerHelloVersion,
-		compressionMethod: config.Bugs.SendCompressionMethod,
-		extensions: serverExtensions{
-			supportedVersion: config.Bugs.SendServerSupportedExtensionVersion,
-		},
-		omitExtensions:  config.Bugs.OmitExtensions,
-		emptyExtensions: config.Bugs.EmptyExtensions,
+		compressionMethod: compressionNone,
+		shortHeader:       config.Bugs.AlwaysNegotiateShortHeader,
 	}
 
 	hs.hello.random = make([]byte, 32)
@@ -1079,10 +1041,6 @@ func (hs *serverHandshakeState) processClientHello() (isResume bool, err error) 
 	}
 	if c.vers <= VersionTLS11 && config.maxVersion(c.isDTLS) == VersionTLS12 {
 		copy(hs.hello.random[len(hs.hello.random)-8:], downgradeTLS12)
-	}
-
-	if len(hs.clientHello.sessionId) == 0 && c.config.Bugs.ExpectClientHelloSessionID {
-		return false, errors.New("tls: expected non-empty session ID from client")
 	}
 
 	foundCompression := false
@@ -1125,9 +1083,6 @@ Curves:
 	hs.ellipticOk = supportedCurve && supportedPointFormat
 
 	_, hs.ecdsaOk = hs.cert.PrivateKey.(*ecdsa.PrivateKey)
-	// Ed25519 also uses ECDSA certificates.
-	_, ed25519Ok := hs.cert.PrivateKey.(ed25519.PrivateKey)
-	hs.ecdsaOk = hs.ecdsaOk || ed25519Ok
 
 	// For test purposes, check that the peer never offers a session when
 	// renegotiating.
@@ -1184,9 +1139,6 @@ func (hs *serverHandshakeState) processClientExtensions(serverExtensions *server
 			if c.config.Bugs.BadRenegotiationInfo {
 				serverExtensions.secureRenegotiation[0] ^= 0x80
 			}
-			if c.config.Bugs.BadRenegotiationInfoEnd {
-				serverExtensions.secureRenegotiation[len(serverExtensions.secureRenegotiation)-1] ^= 0x80
-			}
 		} else {
 			serverExtensions.secureRenegotiation = hs.clientHello.secureRenegotiation
 		}
@@ -1213,16 +1165,7 @@ func (hs *serverHandshakeState) processClientExtensions(serverExtensions *server
 		return errors.New("tls: unexpected server name")
 	}
 
-	if cert := config.Bugs.RenegotiationCertificate; c.cipherSuite != nil && cert != nil {
-		hs.cert = cert
-	}
-
 	if len(hs.clientHello.alpnProtocols) > 0 {
-		// We will never offer ALPN as a client on renegotiation
-		// handshakes.
-		if len(c.clientVerify) > 0 {
-			return errors.New("tls: offered ALPN on renegotiation")
-		}
 		if proto := c.config.Bugs.ALPNProtocol; proto != nil {
 			serverExtensions.alpnProtocol = *proto
 			serverExtensions.alpnProtocolEmpty = len(*proto) == 0
@@ -1295,10 +1238,6 @@ func (hs *serverHandshakeState) processClientExtensions(serverExtensions *server
 
 	if c.config.Bugs.SendSupportedPointFormats != nil {
 		serverExtensions.supportedPoints = c.config.Bugs.SendSupportedPointFormats
-	}
-
-	if c.config.Bugs.SendServerSupportedCurves {
-		serverExtensions.supportedCurves = c.config.curvePreferences()
 	}
 
 	if !hs.clientHello.hasGREASEExtension && config.Bugs.ExpectGREASE {
@@ -1435,10 +1374,6 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		hs.hello.extensions.sctList = hs.cert.SignedCertificateTimestampList
 	}
 
-	if len(c.clientVerify) > 0 && config.Bugs.SendSCTListOnRenegotiation != nil {
-		hs.hello.extensions.sctList = config.Bugs.SendSCTListOnRenegotiation
-	}
-
 	hs.hello.extensions.ticketSupported = hs.clientHello.ticketSupported && !config.SessionTicketsDisabled && c.vers > VersionSSL30
 	hs.hello.cipherSuite = hs.suite.id
 	if config.Bugs.SendCipherSuite != 0 {
@@ -1485,9 +1420,6 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		certStatus := new(certificateStatusMsg)
 		certStatus.statusType = statusTypeOCSP
 		certStatus.response = hs.cert.OCSPStaple
-		if len(c.clientVerify) > 0 && config.Bugs.SendOCSPResponseOnRenegotiation != nil {
-			certStatus.response = config.Bugs.SendOCSPResponseOnRenegotiation
-		}
 		hs.writeServerHash(certStatus.marshal())
 		c.writeRecord(recordTypeHandshake, certStatus.marshal())
 	}
@@ -1690,8 +1622,8 @@ func (hs *serverHandshakeState) establishKeys() error {
 		serverCipher = hs.suite.aead(c.vers, serverKey, serverIV)
 	}
 
-	c.in.prepareCipherSpec(c.wireVersion, clientCipher, clientHash)
-	c.out.prepareCipherSpec(c.wireVersion, serverCipher, serverHash)
+	c.in.prepareCipherSpec(c.vers, clientCipher, clientHash)
+	c.out.prepareCipherSpec(c.vers, serverCipher, serverHash)
 
 	return nil
 }
@@ -1821,6 +1753,7 @@ func (hs *serverHandshakeState) sendFinished(out []byte) error {
 		c.writeRecord(recordTypeHandshake, postCCSBytes)
 		postCCSBytes = nil
 	}
+	c.flushHandshake()
 
 	if !c.config.Bugs.SkipChangeCipherSpec {
 		ccs := []byte{1}
@@ -1843,11 +1776,11 @@ func (hs *serverHandshakeState) sendFinished(out []byte) error {
 		if c.config.Bugs.SendExtraFinished {
 			c.writeRecord(recordTypeHandshake, finished.marshal())
 		}
-	}
 
-	if !c.config.Bugs.PackHelloRequestWithFinished {
-		// Defer flushing until renegotiation.
-		c.flushHandshake()
+		if !c.config.Bugs.PackHelloRequestWithFinished {
+			// Defer flushing until renegotiation.
+			c.flushHandshake()
+		}
 	}
 
 	c.cipherSuite = hs.suite
@@ -1905,13 +1838,13 @@ func (hs *serverHandshakeState) processCertsFromClient(certificates [][]byte) (c
 	}
 
 	if len(certs) > 0 {
-		pub := getCertificatePublicKey(certs[0])
-		switch pub.(type) {
-		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
-			break
+		var pub crypto.PublicKey
+		switch key := certs[0].PublicKey.(type) {
+		case *ecdsa.PublicKey, *rsa.PublicKey:
+			pub = key
 		default:
 			c.sendAlert(alertUnsupportedCertificate)
-			return nil, fmt.Errorf("tls: client's certificate contains an unsupported public key of type %T", pub)
+			return nil, fmt.Errorf("tls: client's certificate contains an unsupported public key of type %T", certs[0].PublicKey)
 		}
 		c.peerCertificates = certs
 		return pub, nil
@@ -1928,7 +1861,7 @@ func verifyChannelIDMessage(channelIDMsg *channelIDMsg, channelIDHash []byte) (*
 	if !elliptic.P256().IsOnCurve(x, y) {
 		return nil, errors.New("tls: invalid channel ID public key")
 	}
-	channelID := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+	channelID := &ecdsa.PublicKey{elliptic.P256(), x, y}
 	if !ecdsa.Verify(channelID, channelIDHash, r, s) {
 		return nil, errors.New("tls: invalid channel ID signature")
 	}

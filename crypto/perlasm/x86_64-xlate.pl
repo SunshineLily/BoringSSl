@@ -207,9 +207,8 @@ my %globals;
 	    }
 	    sprintf "\$%s",$self->{value};
 	} else {
-	    my $value = $self->{value};
-	    $value =~ s/0x([0-9a-f]+)/0$1h/ig if ($masm);
-	    sprintf "%s",$value;
+	    $self->{value} =~ s/0x([0-9a-f]+)/0$1h/ig if ($masm);
+	    sprintf "%s",$self->{value};
 	}
     }
 }
@@ -1135,7 +1134,7 @@ ___
 OPTION	DOTNAME
 ___
 }
-print STDOUT "#if defined(__x86_64__) && !defined(OPENSSL_NO_ASM)\n" if ($gas);
+print STDOUT "#if defined(__x86_64__)\n" if ($gas);
 
 while(defined(my $line=<>)) {
 
@@ -1195,7 +1194,13 @@ while(defined(my $line=<>)) {
 		}
 		@args = reverse(@args);
 		undef $sz if ($nasm && $opcode->mnemonic() eq "lea");
-		printf "\t%s\t%s",$insn,join(",",map($_->out($sz),@args));
+
+		if ($insn eq "movq" && $#args == 1 && $args[0]->out($sz) eq "xmm0" && $args[1]->out($sz) eq "rax") {
+		    # I have no clue why MASM can't parse this instruction.
+		    printf "DB 66h, 48h, 0fh, 6eh, 0c0h";
+		} else {
+		    printf "\t%s\t%s",$insn,join(",",map($_->out($sz),@args));
+		}
 	    }
 	} else {
 	    printf "\t%s",$opcode->out();

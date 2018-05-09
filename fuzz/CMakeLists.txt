@@ -1,7 +1,5 @@
 include_directories(../include)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-missing-prototypes")
-
 add_executable(
   privkey
 
@@ -57,26 +55,6 @@ add_executable(
 target_link_libraries(client Fuzzer)
 target_link_libraries(client crypto)
 target_link_libraries(client ssl)
-
-add_executable(
-  dtls_server
-
-  dtls_server.cc
-)
-
-target_link_libraries(dtls_server Fuzzer)
-target_link_libraries(dtls_server crypto)
-target_link_libraries(dtls_server ssl)
-
-add_executable(
-  dtls_client
-
-  dtls_client.cc
-)
-
-target_link_libraries(dtls_client Fuzzer)
-target_link_libraries(dtls_client crypto)
-target_link_libraries(dtls_client ssl)
 
 add_executable(
   read_pem

@@ -90,25 +90,6 @@ func makeErrors(reset bool) error {
 		return err
 	}
 
-	if filepath.Base(filepath.Dir(dirName)) == "fipsmodule" {
-		// Search the non-FIPS half of library for error codes as well.
-		extraPath := filepath.Join(topLevelPath, "crypto", lib+"_extra")
-		extraDir, err := os.Open(extraPath)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		if err == nil {
-			defer extraDir.Close()
-			extraFilenames, err := extraDir.Readdirnames(-1)
-			if err != nil {
-				return err
-			}
-			for _, extraFilename := range extraFilenames {
-				filenames = append(filenames, filepath.Join(extraPath, extraFilename))
-			}
-		}
-	}
-
 	for _, name := range filenames {
 		if !strings.HasSuffix(name, ".c") {
 			continue
@@ -154,7 +135,7 @@ func findToplevel() (path string, err error) {
 	buildingPath := filepath.Join(path, "BUILDING.md")
 
 	_, err = os.Stat(buildingPath)
-	for i := 0; i < 2 && err != nil && os.IsNotExist(err); i++ {
+	if err != nil && os.IsNotExist(err) {
 		path = filepath.Join("..", path)
 		buildingPath = filepath.Join(path, "BUILDING.md")
 		_, err = os.Stat(buildingPath)

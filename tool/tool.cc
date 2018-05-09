@@ -29,11 +29,6 @@
 #include "internal.h"
 
 
-static bool IsFIPS(const std::vector<std::string> &args) {
-  printf("%d\n", FIPS_mode());
-  return true;
-}
-
 typedef bool (*tool_func_t)(const std::vector<std::string> &args);
 
 struct Tool {
@@ -44,7 +39,6 @@ struct Tool {
 static const Tool kTools[] = {
   { "ciphers", Ciphers },
   { "client", Client },
-  { "isfips", IsFIPS },
   { "generate-ed25519", GenerateEd25519Key },
   { "genrsa", GenerateRSAKey },
   { "md5sum", MD5Sum },
@@ -58,7 +52,6 @@ static const Tool kTools[] = {
   { "sha256sum", SHA256Sum },
   { "sha384sum", SHA384Sum },
   { "sha512sum", SHA512Sum },
-  { "sign", Sign },
   { "speed", Speed },
   { "", nullptr },
 };
@@ -129,10 +122,5 @@ int main(int argc, char **argv) {
     args.push_back(argv[i]);
   }
 
-  if (!tool(args)) {
-    ERR_print_errors_fp(stderr);
-    return 1;
-  }
-
-  return 0;
+  return !tool(args);
 }

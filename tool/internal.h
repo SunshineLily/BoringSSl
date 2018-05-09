@@ -65,8 +65,6 @@ bool GetUnsigned(unsigned *out, const std::string &arg_name,
                  unsigned default_value,
                  const std::map<std::string, std::string> &args);
 
-bool ReadAll(std::vector<uint8_t> *out, FILE *in);
-
 bool Ciphers(const std::vector<std::string> &args);
 bool Client(const std::vector<std::string> &args);
 bool DoPKCS12(const std::vector<std::string> &args);
@@ -80,7 +78,6 @@ bool SHA256Sum(const std::vector<std::string> &args);
 bool SHA384Sum(const std::vector<std::string> &args);
 bool SHA512Sum(const std::vector<std::string> &args);
 bool Server(const std::vector<std::string> &args);
-bool Sign(const std::vector<std::string> &args);
 bool Speed(const std::vector<std::string> &args);
 
 // These values are DER encoded, RSA private keys.
@@ -88,6 +85,8 @@ extern const uint8_t kDERRSAPrivate2048[];
 extern const size_t kDERRSAPrivate2048Len;
 extern const uint8_t kDERRSAPrivate4096[];
 extern const size_t kDERRSAPrivate4096Len;
+extern const uint8_t kDERRSAPrivate3Prime2048[];
+extern const size_t kDERRSAPrivate3Prime2048Len;
 
 
-#endif  // !OPENSSL_HEADER_TOOL_INTERNAL_H
+#endif /* !OPENSSL_HEADER_TOOL_INTERNAL_H */

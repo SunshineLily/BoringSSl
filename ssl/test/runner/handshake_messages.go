@@ -7,7 +7,6 @@ package runner
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 )
 
 func writeLen(buf []byte, v, size int) {
@@ -34,11 +33,6 @@ func newByteBuilder() *byteBuilder {
 
 func (bb *byteBuilder) len() int {
 	return len(*bb.buf) - bb.start - bb.prefixLen
-}
-
-func (bb *byteBuilder) data() []byte {
-	bb.flush()
-	return (*bb.buf)[bb.start+bb.prefixLen:]
 }
 
 func (bb *byteBuilder) flush() {
@@ -118,11 +112,11 @@ func (bb *byteBuilder) createChild(lengthPrefixSize int) *byteBuilder {
 }
 
 func (bb *byteBuilder) discardChild() {
-	if bb.child == nil {
+	if bb.child != nil {
 		return
 	}
-	*bb.buf = (*bb.buf)[:bb.child.start]
 	bb.child = nil
+	*bb.buf = (*bb.buf)[:bb.start]
 }
 
 type keyShareEntry struct {
@@ -173,9 +167,7 @@ type clientHelloMsg struct {
 	customExtension         string
 	hasGREASEExtension      bool
 	pskBinderFirst          bool
-	omitExtensions          bool
-	emptyExtensions         bool
-	pad                     int
+	shortHeaderSupported    bool
 }
 
 func (m *clientHelloMsg) equal(i interface{}) bool {
@@ -222,9 +214,7 @@ func (m *clientHelloMsg) equal(i interface{}) bool {
 		m.customExtension == m1.customExtension &&
 		m.hasGREASEExtension == m1.hasGREASEExtension &&
 		m.pskBinderFirst == m1.pskBinderFirst &&
-		m.omitExtensions == m1.omitExtensions &&
-		m.emptyExtensions == m1.emptyExtensions &&
-		m.pad == m1.pad
+		m.shortHeaderSupported == m1.shortHeaderSupported
 }
 
 func (m *clientHelloMsg) marshal() []byte {
@@ -440,6 +430,10 @@ func (m *clientHelloMsg) marshal() []byte {
 		customExt := extensions.addU16LengthPrefixed()
 		customExt.addBytes([]byte(m.customExtension))
 	}
+	if m.shortHeaderSupported {
+		extensions.addU16(extensionShortHeader)
+		extensions.addU16(0) // Length is always 0
+	}
 	// The PSK extension must be last (draft-ietf-tls-tls13-18 section 4.2.6).
 	if len(m.pskIdentities) > 0 && !m.pskBinderFirst {
 		extensions.addU16(extensionPreSharedKey)
@@ -456,29 +450,11 @@ func (m *clientHelloMsg) marshal() []byte {
 		}
 	}
 
-	if m.pad != 0 && hello.len()%m.pad != 0 {
-		extensions.addU16(extensionPadding)
-		padding := extensions.addU16LengthPrefixed()
-		// Note hello.len() has changed at this point from the length
-		// prefix.
-		if l := hello.len() % m.pad; l != 0 {
-			padding.addBytes(make([]byte, m.pad-l))
-		}
-	}
-
-	if m.omitExtensions || m.emptyExtensions {
-		// Silently erase any extensions which were sent.
+	if extensions.len() == 0 {
 		hello.discardChild()
-		if m.emptyExtensions {
-			hello.addU16(0)
-		}
 	}
 
 	m.raw = handshakeMsg.finish()
-	// Sanity-check padding.
-	if m.pad != 0 && (len(m.raw)-4)%m.pad != 0 {
-		panic(fmt.Sprintf("%d is not a multiple of %d", len(m.raw)-4, m.pad))
-	}
 	return m.raw
 }
 
@@ -829,6 +805,11 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 				return false
 			}
 			m.sctListSupported = true
+		case extensionShortHeader:
+			if length != 0 {
+				return false
+			}
+			m.shortHeaderSupported = true
 		case extensionCustom:
 			m.customExtension = string(data[:length])
 		}
@@ -843,24 +824,22 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 }
 
 type serverHelloMsg struct {
-	raw                   []byte
-	isDTLS                bool
-	vers                  uint16
-	versOverride          uint16
-	supportedVersOverride uint16
-	random                []byte
-	sessionId             []byte
-	cipherSuite           uint16
-	hasKeyShare           bool
-	keyShare              keyShareEntry
-	hasPSKIdentity        bool
-	pskIdentity           uint16
-	compressionMethod     uint8
-	customExtension       string
-	unencryptedALPN       string
-	omitExtensions        bool
-	emptyExtensions       bool
-	extensions            serverExtensions
+	raw               []byte
+	isDTLS            bool
+	vers              uint16
+	versOverride      uint16
+	random            []byte
+	sessionId         []byte
+	cipherSuite       uint16
+	hasKeyShare       bool
+	keyShare          keyShareEntry
+	hasPSKIdentity    bool
+	pskIdentity       uint16
+	compressionMethod uint8
+	customExtension   string
+	unencryptedALPN   string
+	shortHeader       bool
+	extensions        serverExtensions
 }
 
 func (m *serverHelloMsg) marshal() []byte {
@@ -881,23 +860,26 @@ func (m *serverHelloMsg) marshal() []byte {
 	}
 	if m.versOverride != 0 {
 		hello.addU16(m.versOverride)
-	} else if isResumptionExperiment(m.vers) {
-		hello.addU16(VersionTLS12)
 	} else {
 		hello.addU16(m.vers)
 	}
 
 	hello.addBytes(m.random)
-	if vers < VersionTLS13 || isResumptionExperiment(m.vers) {
+	if vers < VersionTLS13 {
 		sessionId := hello.addU8LengthPrefixed()
 		sessionId.addBytes(m.sessionId)
 	}
 	hello.addU16(m.cipherSuite)
-	if vers < VersionTLS13 || isResumptionExperiment(m.vers) {
+	if vers < VersionTLS13 {
 		hello.addU8(m.compressionMethod)
 	}
 
 	extensions := hello.addU16LengthPrefixed()
+
+	if m.shortHeader {
+		extensions.addU16(extensionShortHeader)
+		extensions.addU16(0) // Length
+	}
 
 	if vers >= VersionTLS13 {
 		if m.hasKeyShare {
@@ -911,15 +893,6 @@ func (m *serverHelloMsg) marshal() []byte {
 			extensions.addU16(extensionPreSharedKey)
 			extensions.addU16(2) // Length
 			extensions.addU16(m.pskIdentity)
-		}
-		if isResumptionExperiment(m.vers) || m.supportedVersOverride != 0 {
-			extensions.addU16(extensionSupportedVersions)
-			extensions.addU16(2) // Length
-			if m.supportedVersOverride != 0 {
-				extensions.addU16(m.supportedVersOverride)
-			} else {
-				extensions.addU16(m.vers)
-			}
 		}
 		if len(m.customExtension) > 0 {
 			extensions.addU16(extensionCustom)
@@ -936,17 +909,8 @@ func (m *serverHelloMsg) marshal() []byte {
 		}
 	} else {
 		m.extensions.marshal(extensions)
-		if m.omitExtensions || m.emptyExtensions {
-			// Silently erasing server extensions will break the handshake. Instead,
-			// assert that tests which use this field also disable all features which
-			// would write an extension.
-			if extensions.len() != 0 {
-				panic(fmt.Sprintf("ServerHello unexpectedly contained extensions: %x, %+v", extensions.data(), m))
-			}
+		if extensions.len() == 0 {
 			hello.discardChild()
-			if m.emptyExtensions {
-				hello.addU16(0)
-			}
 		}
 	}
 
@@ -966,7 +930,7 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	}
 	m.random = data[6:38]
 	data = data[38:]
-	if vers < VersionTLS13 || isResumptionExperiment(m.vers) {
+	if vers < VersionTLS13 {
 		sessionIdLen := int(data[0])
 		if sessionIdLen > 32 || len(data) < 1+sessionIdLen {
 			return false
@@ -979,7 +943,7 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	}
 	m.cipherSuite = uint16(data[0])<<8 | uint16(data[1])
 	data = data[2:]
-	if vers < VersionTLS13 || isResumptionExperiment(m.vers) {
+	if vers < VersionTLS13 {
 		if len(data) < 1 {
 			return false
 		}
@@ -990,7 +954,6 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	if len(data) == 0 && m.vers < VersionTLS13 {
 		// Extension data is optional before TLS 1.3.
 		m.extensions = serverExtensions{}
-		m.omitExtensions = true
 		return true
 	}
 	if len(data) < 2 {
@@ -1001,36 +964,6 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 	data = data[2:]
 	if len(data) != extensionsLength {
 		return false
-	}
-
-	// Parse out the version from supported_versions if available.
-	if m.vers == VersionTLS12 {
-		vdata := data
-		for len(vdata) != 0 {
-			if len(vdata) < 4 {
-				return false
-			}
-			extension := uint16(vdata[0])<<8 | uint16(vdata[1])
-			length := int(vdata[2])<<8 | int(vdata[3])
-			vdata = vdata[4:]
-
-			if len(vdata) < length {
-				return false
-			}
-			d := vdata[:length]
-			vdata = vdata[length:]
-
-			if extension == extensionSupportedVersions {
-				if len(d) < 2 {
-					return false
-				}
-				m.vers = uint16(d[0])<<8 | uint16(d[1])
-				vers, ok = wireToVersion(m.vers, m.isDTLS)
-				if !ok {
-					return false
-				}
-			}
-		}
 	}
 
 	if vers >= VersionTLS13 {
@@ -1067,10 +1000,11 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 				}
 				m.pskIdentity = uint16(d[0])<<8 | uint16(d[1])
 				m.hasPSKIdentity = true
-			case extensionSupportedVersions:
-				if !isResumptionExperiment(m.vers) {
+			case extensionShortHeader:
+				if len(d) != 0 {
 					return false
 				}
+				m.shortHeader = true
 			default:
 				// Only allow the 3 extensions that are sent in
 				// the clear in TLS 1.3.
@@ -1147,9 +1081,7 @@ type serverExtensions struct {
 	hasKeyShare             bool
 	hasEarlyData            bool
 	keyShare                keyShareEntry
-	supportedVersion        uint16
 	supportedPoints         []uint8
-	supportedCurves         []CurveID
 	serverNameAck           bool
 }
 
@@ -1245,26 +1177,12 @@ func (m *serverExtensions) marshal(extensions *byteBuilder) {
 		keyExchange := keyShare.addU16LengthPrefixed()
 		keyExchange.addBytes(m.keyShare.keyExchange)
 	}
-	if m.supportedVersion != 0 {
-		extensions.addU16(extensionSupportedVersions)
-		extensions.addU16(2) // Length
-		extensions.addU16(m.supportedVersion)
-	}
 	if len(m.supportedPoints) > 0 {
 		// http://tools.ietf.org/html/rfc4492#section-5.1.2
 		extensions.addU16(extensionSupportedPoints)
 		supportedPointsList := extensions.addU16LengthPrefixed()
 		supportedPoints := supportedPointsList.addU8LengthPrefixed()
 		supportedPoints.addBytes(m.supportedPoints)
-	}
-	if len(m.supportedCurves) > 0 {
-		// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.4
-		extensions.addU16(extensionSupportedCurves)
-		supportedCurvesList := extensions.addU16LengthPrefixed()
-		supportedCurves := supportedCurvesList.addU16LengthPrefixed()
-		for _, curve := range m.supportedCurves {
-			supportedCurves.addU16(uint16(curve))
-		}
 	}
 	if m.hasEarlyData {
 		extensions.addU16(extensionEarlyData)
